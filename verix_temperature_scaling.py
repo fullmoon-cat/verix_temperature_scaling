@@ -1,3 +1,4 @@
+from logging import error
 import torch
 from torch import nn, optim
 from torch.nn import functional as F
@@ -11,14 +12,15 @@ class ModelWithVeriXTemperature(nn.Module):
         NB: Output of the neural network should be the classification logits,
             NOT the softmax (or log softmax)!
     """
-    def __init__(self, model):
+    def __init__(self, model, scaling_method):
         super(ModelWithVeriXTemperature, self).__init__()
         self.model = model
         self.temperature = nn.Parameter(torch.ones(1))# * 1.5)
+        self.scaling_method = scaling_method
 
-    def forward(self, input):
+    def forward(self, input, explanation_sizes):
         logits = self.model(input)
-        return self.temperature_scale(logits)
+        return self.temperature_scale(logits, explanation_sizes)
 
     def temperature_scale(self, logits, explanation_sizes):
         """
@@ -27,7 +29,17 @@ class ModelWithVeriXTemperature(nn.Module):
         # Expand temperature and explanation sizes to match the size of logits
         temperature = self.temperature.unsqueeze(1).expand(logits.size(0), logits.size(1))
         explanation_sizes = explanation_sizes.unsqueeze(1).expand(logits.size(0), logits.size(1))
-        return logits / temperature / torch.add(explanation_sizes, 1)
+        match self.scaling_method:
+          case 'original':
+            return logits / temperature / torch.add(explanation_sizes, 1)
+          case 'inverse':
+            return logits / temperature / torch.add(1 / explanation_sizes, 1)
+          case 'square':
+            return logits / temperature / torch.add(explanation_sizes ** 2, 1)
+          case 'square-outside':
+            return logits / temperature / torch.add(explanation_sizes, 1) ** 2
+          case _:
+            raise Exception("invalid scaling method")
 
     # This function probably should live outside of this class, but whatever
     def set_temperature(self, valid_loader, explanation_sizes, max_iter):
@@ -74,7 +86,7 @@ class ModelWithVeriXTemperature(nn.Module):
         print('Optimal temperature: %.3f' % self.temperature.item())
         print('After temperature - NLL: %.3f, ECE: %.3f' % (after_temperature_nll, after_temperature_ece))
 
-        return self
+        return self, before_temperature_nll, before_temperature_ece, after_temperature_nll, after_temperature_ece
     
     def test(self, test_loader, explanation_sizes):
         print("Testing")
@@ -101,10 +113,12 @@ class ModelWithVeriXTemperature(nn.Module):
         print('Before temperature - NLL: %.3f, ECE: %.3f' % (before_temperature_nll, before_temperature_ece))
 
         # Calculate NLL and ECE after temperature scaling
-        after_temperature_nll = nll_criterion(self.temperature_scale(logits, explanation_sizes), labels).item()
-        after_temperature_ece = ece_criterion(self.temperature_scale(logits, explanation_sizes), labels).item()
+        scaled_logits = self.temperature_scale(logits, explanation_sizes)
+        after_temperature_nll = nll_criterion(scaled_logits, labels).item()
+        after_temperature_ece = ece_criterion(scaled_logits, labels).item()
         print('Temperature: %.3f' % self.temperature.item())
         print('After temperature - NLL: %.3f, ECE: %.3f' % (after_temperature_nll, after_temperature_ece))
 
+        return scaled_logits, after_temperature_nll, after_temperature_ece
 
 
